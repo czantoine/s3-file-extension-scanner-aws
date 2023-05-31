@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "This AWS CloudFormation code creates a serverless application to scan S3 buckets for file extension anomalies - Antoine Cichowicz, visit the GitHub repository: Yris Ops."
+
+Parameters:
+  BucketList:
+    Type: String
+    Description: Comma-separated list of buckets to check
+    Default: "bucket1, bucket2"
+
+  EmailAddress:
+    Type: String
+    Description: The email address to receive the notification
+
+  CronStart:
+    Type: String
+    Default: 0 0 ? * SUN *
+
+Resources:
+  S3FileExtensionScannerFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Environment:
+        Variables:
+          SNSTopicArn: !Ref AlertSNSTopic
+          BucketList: !Ref BucketList
+      FunctionName: S3FileExtensionScannerFunction
+      Runtime: python3.8
+      Handler: index.lambda_handler
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          SNSTopicArn = os.environ['SNSTopicArn']
+          BucketList = os.environ['BucketList']
+
+          def lambda_handler(event, context):
+              s3_client = boto3.client('s3')
+              bucket_list = BucketList.split(', ')
+
+              file_info = {}
+
+              for bucket_name in bucket_list:
+                  check_bucket(s3_client, bucket_name, file_info)
+
+              report_subject = 'S3 Bucket File Extension Anomaly Report'
+              report_body = generate_report(file_info)
+
+              if file_info:
+                  send_report(report_subject, report_body, "Antoine CICHOWICZ", "https://github.com/Yris-ops")
+              else:
+                  print("No files found. Report will not be sent.")
+
+          def check_bucket(s3_client, bucket_name, file_info):
+              stack = ['']
+              while stack:
+                  prefix = stack.pop()
+                  response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
+                  
+                  if 'Contents' in response:
+                      for obj in response['Contents']:
+                          key = obj['Key']
+                          if key.lower().endswith(('.mp3', '.mp4', '.mov', '.torrent', '.xyz', '.wtf', '.bln', '.zzz', '.boz')):
+                              file_info.setdefault(bucket_name, []).append(key)
+                          else:
+                              if key.endswith('/'):
+                                  stack.append(key)
+
+                  if 'CommonPrefixes' in response:
+                      for prefix in response['CommonPrefixes']:
+                          prefix_name = prefix['Prefix']
+                          stack.append(prefix_name)
+
+          def generate_report(file_info):
+              report_body = 'List of buckets:\n\n'
+              for bucket_name, files in file_info.items():
+                  report_body += f"{bucket_name}:\n"
+                  if files:
+                      for file_name in files:
+                          report_body += f" - {file_name}\n"
+                  else:
+                      report_body += "No files found.\n"
+                  report_body += '\n'
+              return report_body
+
+          def send_report(subject, body, name, github_link):
+              sns_client = boto3.client('sns')
+              sns_topic_arn = SNSTopicArn
+              message = f"{body}\n\nBy : {name}\nGitHub : {github_link}"
+
+              try:
+                  response = sns_client.publish(
+                      TopicArn=sns_topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+                  print("Report sent via email.")
+              except ClientError as e:
+                  print(f"Error sending report via email: {e.response['Error']['Message']}")
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                  - 's3:List*'
+                  - 's3-object-lambda:List*'
+                Resource: 
+                  - '*'
+                  - !Ref AlertSNSTopic
+
+  AlertSNSTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'S3 File Extension Anomaly Alert'
+      Subscription:
+        - Endpoint: !Ref EmailAddress
+          Protocol: email
+
+  WeeklySchedulerRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: WeeklySchedulerRule
+      ScheduleExpression: !Sub 'cron(${CronStart})'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt S3FileExtensionScannerFunction.Arn
+          Id: S3FileExtensionScannerFunction
+
+  PermissionForEventsToInvokeLambda:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt S3FileExtensionScannerFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklySchedulerRule.Arn
+
+Outputs:
+  AlertSNSTopicArn: 
+    Description: ARN for SNS topic related to anomaly alerts
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertSNSTopicArn'
+    Value: !Ref AlertSNSTopic
